@@ -7,7 +7,7 @@ DTYPE = np.uint8
 MAX_FRAME_BYTES = MAX_HEIGHT * MAX_WIDTH * np.dtype(DTYPE).itemsize  # 5.76 MB
 
 # 96 GB dynamic ring pool + 1 full-frame slot at the end for live preview
-RING_BUFFER_BYTES = 96 * (1024 ** 3)
+RING_BUFFER_BYTES = 64 * (1024 ** 3)
 TOTAL_SHM_BYTES = RING_BUFFER_BYTES + MAX_FRAME_BYTES
 SHM_NAME = "kinetix22_8bit_ring"
 
