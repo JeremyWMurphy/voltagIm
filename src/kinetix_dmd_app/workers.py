@@ -160,3 +160,98 @@ def camera_worker(
             cam.close()
         pvc.uninit_pvcam()
         shm.close()
+
+def disk_writer_worker(
+    worker_id: int,
+    base_dir: str,
+    run_folder_buf: Array,
+    shm_name: str,
+    write_idx: Value,
+    read_idx: Value,
+    roi_w: Value,
+    roi_h: Value,
+    active_slots: Value,
+    frames_per_tiff: Value,
+    record_event: Event,
+    shutdown_event: Event,
+):
+    shm = shared_memory.SharedMemory(name=shm_name)
+
+    chunk_index = worker_id
+    tif_writer = None
+    frames_in_file = 0
+    active_run_folder = ""
+
+    # Per-run dynamic ring state
+    ring_buffer = None
+    run_slots = 1
+    run_chunk_frames = 1000
+
+    while not shutdown_event.is_set() or (read_idx.value < write_idx.value):
+        current_run_folder = run_folder_buf.value.decode("utf-8")
+        if current_run_folder != active_run_folder and current_run_folder != "":
+            # Close any leftover writer from a prior run just in case
+            if tif_writer is not None:
+                tif_writer.close()
+                tif_writer = None
+                frames_in_file = 0
+
+            active_run_folder = current_run_folder
+            chunk_index = worker_id
+
+            # Snapshot the run's dynamic dimensions and chunk target
+            w, h = roi_w.value, roi_h.value
+            run_slots = active_slots.value
+            run_chunk_frames = frames_per_tiff.value
+            ring_buffer = np.ndarray(
+                (run_slots, h, w),
+                dtype=cfg.DTYPE,
+                buffer=shm.buf,
+                offset=0,
+            )
+
+        with read_idx.get_lock():
+            if read_idx.value >= write_idx.value or ring_buffer is None:
+                claim_idx = None
+            else:
+                assigned_worker = (read_idx.value // run_chunk_frames) % 2
+                if assigned_worker == worker_id:
+                    claim_idx = read_idx.value
+                    read_idx.value += 1
+                else:
+                    claim_idx = None
+
+        if claim_idx is None:
+            if (
+                not record_event.is_set()
+                and (read_idx.value >= write_idx.value)
+                and tif_writer is not None
+            ):
+                tif_writer.close()
+                tif_writer = None
+                frames_in_file = 0
+                print(f"[Writer {worker_id}] Run flushed and file closed.")
+            time.sleep(0.0005)
+            continue
+
+        if tif_writer is None:
+            out_dir = os.path.join(base_dir, active_run_folder)
+            os.makedirs(out_dir, exist_ok=True)
+            filepath = os.path.join(out_dir, f"kinetix8bit_chunk_{chunk_index:04d}.tif")
+            tif_writer = tifffile.TiffWriter(filepath, bigtiff=True, ome=False)
+            frames_in_file = 0
+
+        slot = claim_idx % run_slots
+        # Each slot already has exact (h, w) contiguous layout
+        tif_writer.write(ring_buffer[slot], contiguous=True)
+        frames_in_file += 1
+
+        if frames_in_file >= run_chunk_frames:
+            tif_writer.close()
+            tif_writer = None
+            chunk_index += 2
+
+    if tif_writer is not None:
+        tif_writer.close()
+    shm.close()
+
