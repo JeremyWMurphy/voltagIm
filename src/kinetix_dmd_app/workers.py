@@ -8,11 +8,13 @@ from pyvcam.camera import Camera
 
 import config as cfg
 
+
 def camera_worker(
     shm_name: str,
     write_idx: Value,
     read_idx: Value,
     preview_counter: Value,
+    sdk_fps: Value,
     preview_event: Event,
     record_event: Event,
     shutdown_event: Event,
@@ -21,11 +23,17 @@ def camera_worker(
     roi_y: Value,
     roi_w: Value,
     roi_h: Value,
+    active_slots: Value,
     gate_led_ttl: bool,
 ):
     shm = shared_memory.SharedMemory(name=shm_name)
-    ring_buffer = np.ndarray(
-        (cfg.TOTAL_SLOTS, cfg.MAX_HEIGHT, cfg.MAX_WIDTH), dtype=cfg.DTYPE, buffer=shm.buf
+
+    # Dedicated preview frame anchored at the end of the shared memory block
+    preview_buffer = np.ndarray(
+        (cfg.MAX_HEIGHT, cfg.MAX_WIDTH),
+        dtype=cfg.DTYPE,
+        buffer=shm.buf,
+        offset=cfg.RING_BUFFER_BYTES,
     )
 
     pvc.init_pvcam()
@@ -58,7 +66,7 @@ def camera_worker(
             except Exception as e:
                 print(f"[Camera] Could not set exp_out_mode: {e}")
 
-        print(f"[Camera] {cam.name} ready (8-bit Speed, µs exposure + ROI enabled).")
+        print(f"[Camera] {cam.name} ready (8-bit Speed, us exposure + dynamic ROI ring enabled).")
 
         def apply_roi_and_exp():
             w = max(64, (roi_w.value // 8) * 8)
@@ -71,24 +79,40 @@ def camera_worker(
             return w, h
 
         while not shutdown_event.is_set():
-            # --- MODE A: HIGH-SPEED STREAMING TO RAM/DISK ---
+            # --- MODE A: HIGH-SPEED STREAMING TO DYNAMIC RING ---
             if record_event.is_set():
                 w, h = apply_roi_and_exp()
-                cam.start_live(buffer_frame_count=256)
-                print(f"[Camera] Recording {w}x{h} @ {cam.exp_time} µs exposure...")
+                n_slots = active_slots.value
+
+                # Build zero-copy 3D view sized specifically for this run's ROI
+                ring_buffer = np.ndarray(
+                    (n_slots, h, w),
+                    dtype=cfg.DTYPE,
+                    buffer=shm.buf,
+                    offset=0,
+                )
+
+                # 2048-frame SDK buffer provides ~1 s DMA cushion at 2 kHz
+                sdk_frames = min(2048, n_slots)
+                cam.start_live(buffer_frame_count=sdk_frames)
+                print(
+                    f"[Camera] Recording {w}x{h} @ {cam.exp_time} us "
+                    f"({n_slots} slots in 96 GB ring)..."
+                )
 
                 while record_event.is_set() and not shutdown_event.is_set():
-                    if (write_idx.value - read_idx.value) >= cfg.BUFFER_SLOTS - 4:
+                    if (write_idx.value - read_idx.value) >= n_slots - 4:
                         print("[WARNING] RAM Ring Buffer Full! Dropping frame.")
                         time.sleep(0.0005)
                         continue
 
                     frame, fps, _ = cam.poll_frame()
-                    slot = write_idx.value % cfg.BUFFER_SLOTS
-                    ring_buffer[slot, :h, :w] = frame["pixel_data"]
+                    sdk_fps.value = fps
+                    slot = write_idx.value % n_slots
+                    ring_buffer[slot] = frame["pixel_data"]
 
-                    with write_idx.get_lock():
-                        write_idx.value += 1
+                    # Single-producer increment (no lock needed while recording)
+                    write_idx.value += 1
 
                 cam.finish()
                 print(f"[Camera] Recording stopped. Captured: {write_idx.value}")
@@ -97,7 +121,8 @@ def camera_worker(
             elif preview_event.is_set():
                 w, h = apply_roi_and_exp()
                 active_params = (roi_x.value, roi_y.value, w, h, cam.exp_time)
-                cam.start_live(buffer_frame_count=16)
+                cam.start_live(buffer_frame_count=64)
+                last_ui_copy = 0.0
 
                 while (
                     preview_event.is_set()
@@ -115,97 +140,23 @@ def camera_worker(
                         cam.finish()
                         w, h = apply_roi_and_exp()
                         active_params = (roi_x.value, roi_y.value, w, h, cam.exp_time)
-                        cam.start_live(buffer_frame_count=16)
+                        cam.start_live(buffer_frame_count=64)
 
                     frame, fps, _ = cam.poll_frame()
-                    ring_buffer[cfg.PREVIEW_SLOT, :h, :w] = frame["pixel_data"]
-                    with preview_counter.get_lock():
-                        preview_counter.value += 1
+                    sdk_fps.value = fps
+                    preview_counter.value += 1
 
-                    time.sleep(0.025)
+                    # Only copy pixels to preview_buffer at ~30 Hz to save CPU/RAM bandwidth
+                    now = time.perf_counter()
+                    if (now - last_ui_copy) >= 0.033:
+                        preview_buffer[:h, :w] = frame["pixel_data"]
+                        last_ui_copy = now
 
                 cam.finish()
-            else:
-                time.sleep(0.02)
+
 
     finally:
         if cam is not None and cam.is_open:
             cam.close()
         pvc.uninit_pvcam()
         shm.close()
-
-
-def disk_writer_worker(
-    worker_id: int,
-    base_dir: str,
-    run_folder_buf: Array,
-    shm_name: str,
-    write_idx: Value,
-    read_idx: Value,
-    roi_w: Value,
-    roi_h: Value,
-    record_event: Event,
-    shutdown_event: Event,
-):
-    shm = shared_memory.SharedMemory(name=shm_name)
-    ring_buffer = np.ndarray(
-        (cfg.TOTAL_SLOTS, cfg.MAX_HEIGHT, cfg.MAX_WIDTH), dtype=cfg.DTYPE, buffer=shm.buf
-    )
-
-    chunk_index = worker_id
-    tif_writer = None
-    frames_in_file = 0
-    active_run_folder = ""
-
-    while not shutdown_event.is_set() or (read_idx.value < write_idx.value):
-        current_run_folder = run_folder_buf.value.decode("utf-8")
-        if current_run_folder != active_run_folder and current_run_folder != "":
-            active_run_folder = current_run_folder
-            chunk_index = worker_id
-
-        with read_idx.get_lock():
-            if read_idx.value >= write_idx.value:
-                claim_idx = None
-            else:
-                assigned_worker = (read_idx.value // cfg.FRAMES_PER_TIFF) % 2
-                if assigned_worker == worker_id:
-                    claim_idx = read_idx.value
-                    read_idx.value += 1
-                else:
-                    claim_idx = None
-
-        if claim_idx is None:
-            if (
-                not record_event.is_set()
-                and (read_idx.value >= write_idx.value)
-                and tif_writer is not None
-            ):
-                tif_writer.close()
-                tif_writer = None
-                frames_in_file = 0
-                print(f"[Writer {worker_id}] Run flushed and file closed.")
-            time.sleep(0.0005)
-            continue
-
-        if tif_writer is None:
-            out_dir = os.path.join(base_dir, active_run_folder)
-            os.makedirs(out_dir, exist_ok=True)
-            filepath = os.path.join(out_dir, f"kinetix8bit_chunk_{chunk_index:04d}.tif")
-            tif_writer = tifffile.TiffWriter(filepath, bigtiff=True, ome=False)
-            frames_in_file = 0
-
-        slot = claim_idx % cfg.BUFFER_SLOTS
-        w, h = roi_w.value, roi_h.value
-        frame_view = np.ascontiguousarray(ring_buffer[slot, :h, :w])
-
-        tif_writer.write(frame_view, contiguous=True)
-        frames_in_file += 1
-
-        if frames_in_file >= cfg.FRAMES_PER_TIFF:
-            tif_writer.close()
-            tif_writer = None
-            chunk_index += 2
-
-    if tif_writer is not None:
-        tif_writer.close()
-    shm.close()

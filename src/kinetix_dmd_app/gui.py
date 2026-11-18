@@ -75,6 +75,7 @@ class MicroscopeGUI(QMainWindow):
         write_idx,
         read_idx,
         preview_counter,
+        sdk_fps,
         preview_event,
         record_event,
         shutdown_event,
@@ -83,6 +84,8 @@ class MicroscopeGUI(QMainWindow):
         roi_y,
         roi_w,
         roi_h,
+        active_slots,
+        frames_per_tiff,
         run_folder_buf,
         dmd_ctrl,
     ):
@@ -91,22 +94,32 @@ class MicroscopeGUI(QMainWindow):
         self.resize(1060, 900)
 
         self.shm = shm
-        self.ring_buffer = np.ndarray(
-            (cfg.TOTAL_SLOTS, cfg.MAX_HEIGHT, cfg.MAX_WIDTH), dtype=cfg.DTYPE, buffer=shm.buf
+        self.preview_buffer = np.ndarray(
+            (cfg.MAX_HEIGHT, cfg.MAX_WIDTH),
+            dtype=cfg.DTYPE,
+            buffer=shm.buf,
+            offset=cfg.RING_BUFFER_BYTES,
         )
         self.write_idx = write_idx
         self.read_idx = read_idx
         self.preview_counter = preview_counter
+        self.sdk_fps = sdk_fps
         self.preview_event = preview_event
         self.record_event = record_event
         self.shutdown_event = shutdown_event
         self.exposure_us = exposure_us
         self.roi_x, self.roi_y, self.roi_w, self.roi_h = roi_x, roi_y, roi_w, roi_h
+        self.active_slots = active_slots
+        self.frames_per_tiff = frames_per_tiff
         self.run_folder_buf = run_folder_buf
         self.dmd_ctrl = dmd_ctrl
 
+        # Smoothed FPS tracking state
         self.last_t = time.perf_counter()
         self.last_w = 0
+        self.last_p = 0
+        self.display_fps = 0.0
+
         self.latest_sub = None
         self.lut = np.arange(256, dtype=np.uint8)
 
@@ -225,7 +238,7 @@ class MicroscopeGUI(QMainWindow):
         layout.addWidget(cam_box)
 
         # --- 4. Telemetry ---
-        self.lbl_status = QLabel(f"Status: Idle | Buffer: 0 / {cfg.BUFFER_SLOTS} frames")
+        self.lbl_status = QLabel(f"Status: Idle | Buffer: 0 / {self.active_slots.value} frames")
         self.lbl_status.setStyleSheet("font-size: 13px; font-weight: bold;")
         layout.addWidget(self.lbl_status)
 
@@ -270,10 +283,8 @@ class MicroscopeGUI(QMainWindow):
         hist_layout.addWidget(btn_auto_contrast)
         hist_layout.addWidget(btn_reset_contrast)
         hist_layout.addStretch()
-
         view_layout.addWidget(hist_panel, stretch=1)
         layout.addLayout(view_layout)
-
         self.setCentralWidget(central)
 
     def set_roi_preset(self, x, y, w, h):
@@ -337,6 +348,9 @@ class MicroscopeGUI(QMainWindow):
         self.record_event.clear()
         self.apply_roi_values()
         self.exposure_us.value = self.spin_exp.value()
+        self.last_p = self.preview_counter.value
+        self.last_t = time.perf_counter()
+        self.display_fps = 0.0
         self.preview_event.set()
         self.btn_preview.setEnabled(False)
         self.btn_start.setEnabled(True)
@@ -346,15 +360,25 @@ class MicroscopeGUI(QMainWindow):
         self.preview_event.clear()
         time.sleep(0.05)
         self.apply_roi_values()
+
+        # Compute dynamic slot capacity and ~4 GB BigTIFF chunk stride for this ROI
+        frame_bytes = self.roi_w.value * self.roi_h.value * np.dtype(cfg.DTYPE).itemsize
+        self.active_slots.value = max(16, cfg.RING_BUFFER_BYTES // frame_bytes)
+        self.frames_per_tiff.value = max(1, cfg.TARGET_TIFF_BYTES // frame_bytes)
+
         with self.write_idx.get_lock():
             self.write_idx.value = 0
         with self.read_idx.get_lock():
             self.read_idx.value = 0
         self.last_w = 0
+        self.last_t = time.perf_counter()
+        self.display_fps = 0.0
+
         timestamp = datetime.now().strftime("run_%Y%m%d_%H%M%S")
         self.run_folder_buf.value = timestamp.encode("utf-8")
         self.exposure_us.value = self.spin_exp.value()
         self.record_event.set()
+
         self.btn_preview.setEnabled(False)
         self.btn_start.setEnabled(False)
         self.spin_exp.setEnabled(False)
@@ -363,6 +387,7 @@ class MicroscopeGUI(QMainWindow):
     def on_stop(self):
         self.preview_event.clear()
         self.record_event.clear()
+        self.display_fps = 0.0
         self.btn_stop.setEnabled(False)
         self.btn_preview.setEnabled(True)
         self.btn_start.setEnabled(True)
@@ -384,14 +409,24 @@ class MicroscopeGUI(QMainWindow):
         now = time.perf_counter()
         w = self.write_idx.value
         r = self.read_idx.value
+        p = self.preview_counter.value
 
+        # Update rolling FPS every 0.5 seconds to eliminate QTimer UI jitter
         dt = now - self.last_t
-        live_fps = (w - self.last_w) / dt if dt > 0 else 0.0
-        self.last_t = now
-        self.last_w = w
+        if dt >= 0.5:
+            if self.record_event.is_set():
+                self.display_fps = (w - self.last_w) / dt
+            elif self.preview_event.is_set():
+                self.display_fps = (p - self.last_p) / dt
+            else:
+                self.display_fps = 0.0
+            self.last_t = now
+            self.last_w = w
+            self.last_p = p
 
         buffered = w - r
         roi_w, roi_h = self.roi_w.value, self.roi_h.value
+        n_slots = self.active_slots.value
         gb_used = (buffered * roi_w * roi_h) / (1024 ** 3)
 
         if self.record_event.is_set():
@@ -404,19 +439,27 @@ class MicroscopeGUI(QMainWindow):
             mode_str = "IDLE"
 
         self.lbl_status.setText(
-            f"[{mode_str} | {roi_w}x{roi_h}] Rate: {live_fps:.1f} FPS | "
-            f"Buffer: {buffered} ({gb_used:.2f} GB) | Captured: {w} | Written: {r}"
+            f"[{mode_str} | {roi_w}x{roi_h}] Rate: {self.display_fps:.1f} FPS "
+            f"(SDK: {self.sdk_fps.value:.1f}) | Buffer: {buffered}/{n_slots} ({gb_used:.2f} GB) | "
+            f"Captured: {w} | Written: {r}"
         )
 
-        display_slot = None
-        if self.preview_event.is_set() and self.preview_counter.value > 0:
-            display_slot = cfg.PREVIEW_SLOT
-        elif w > 0:
-            display_slot = (w - 1) % cfg.BUFFER_SLOTS
+        step = max(1, max(roi_w, roi_h) // 400)
+        sub = None
 
-        if display_slot is not None:
-            step = max(1, max(roi_w, roi_h) // 400)
-            sub = np.ascontiguousarray(self.ring_buffer[display_slot, :roi_h:step, :roi_w:step])
+        if self.preview_event.is_set() and p > 0:
+            sub = np.ascontiguousarray(self.preview_buffer[:roi_h:step, :roi_w:step])
+        elif w > 0:
+            ring_view = np.ndarray(
+                (n_slots, roi_h, roi_w),
+                dtype=cfg.DTYPE,
+                buffer=self.shm.buf,
+                offset=0,
+            )
+            slot = (w - 1) % n_slots
+            sub = np.ascontiguousarray(ring_view[slot, ::step, ::step])
+
+        if sub is not None:
             self.latest_sub = sub
             self.hist_widget.update_data(sub, self.slider_min.value(), self.slider_max.value())
             disp = np.ascontiguousarray(self.lut[sub])
