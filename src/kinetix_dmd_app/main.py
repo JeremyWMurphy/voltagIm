@@ -2,12 +2,42 @@ import ctypes
 import time
 from multiprocessing import Array, Event, Process, Value, shared_memory
 import numpy as np
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication
 
 import config as cfg
 from dmd import StaticDMDController
 from gui import MicroscopeGUI
 from workers import camera_worker, disk_writer_worker
+
+
+def apply_dark_theme(app: QApplication):
+    """Apply a global Fusion dark palette across the entire application."""
+    app.setStyle("Fusion")
+    palette = QPalette()
+
+    # Base surfaces
+    palette.setColor(QPalette.Window, QColor(30, 30, 30))
+    palette.setColor(QPalette.WindowText, Qt.white)
+    palette.setColor(QPalette.Base, QColor(20, 20, 20))
+    palette.setColor(QPalette.AlternateBase, QColor(38, 38, 38))
+    palette.setColor(QPalette.ToolTipBase, QColor(45, 45, 45))
+    palette.setColor(QPalette.ToolTipText, Qt.white)
+
+    # Controls & text
+    palette.setColor(QPalette.Text, Qt.white)
+    palette.setColor(QPalette.Button, QColor(45, 45, 45))
+    palette.setColor(QPalette.ButtonText, Qt.white)
+    palette.setColor(QPalette.BrightText, Qt.red)
+
+    # Highlights & disabled states
+    palette.setColor(QPalette.Highlight, QColor(21, 101, 192))
+    palette.setColor(QPalette.HighlightedText, Qt.white)
+    palette.setColor(QPalette.Disabled, QPalette.Text, QColor(127, 127, 127))
+    palette.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(127, 127, 127))
+
+    app.setPalette(palette)
 
 
 def prefault_shared_memory(shm: shared_memory.SharedMemory, page_size: int = 4096):
@@ -56,6 +86,8 @@ if __name__ == "__main__":
     shutdown_event = Event()
 
     app = QApplication([])
+    apply_dark_theme(app)
+
     dmd_ctrl = StaticDMDController(alp_version="4.3")
     window = MicroscopeGUI(
         shm,

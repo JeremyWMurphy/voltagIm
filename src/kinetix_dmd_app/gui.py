@@ -48,7 +48,7 @@ class HistogramWidget(QWidget):
         painter.fillRect(0, 0, w, h, QColor("#181818"))
 
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor("#4fc3f7"))
+        painter.setBrush(QColor("#45f50b"))
         bar_w = w / 256.0
         for i in range(256):
             bar_h = int(self.hist[i] * (h - 10))
@@ -58,13 +58,13 @@ class HistogramWidget(QWidget):
         x_min = int((self.min_val / 255.0) * (w - 1))
         x_max = int((self.max_val / 255.0) * (w - 1))
 
-        painter.setPen(QPen(QColor("#66bb6a"), 2))
+        painter.setPen(QPen(QColor("#07eff7"), 2))
         painter.drawLine(x_min, 0, x_min, h)
 
-        painter.setPen(QPen(QColor("#ffee58"), 2))
+        painter.setPen(QPen(QColor("#f5f903"), 2))
         painter.drawLine(x_max, 0, x_max, h)
 
-        painter.setPen(QPen(QColor("#ffffff"), 1, Qt.DashLine))
+        painter.setPen(QPen(QColor("#f203f6"), 1, Qt.DashLine))
         painter.drawLine(x_min, h - 2, x_max, 2)
 
 
