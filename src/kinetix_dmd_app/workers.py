@@ -8,7 +8,6 @@ from pyvcam.camera import Camera
 
 import config as cfg
 
-
 def camera_worker(
     shm_name: str,
     write_idx: Value,
