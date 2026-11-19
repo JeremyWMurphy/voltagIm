@@ -13,6 +13,7 @@ class StaticDMDController:
         self.connected = False
         self.width = 1024
         self.height = 768
+        self.last_mask_info = "none"
 
         if not HAS_ALP4:
             print("[DMD] ALP4lib not installed. Running in simulated DMD mode.")
@@ -29,9 +30,11 @@ class StaticDMDController:
             print(f"[DMD] Hardware not detected ({e}). Running in simulated mode.")
             self.connected = False
 
-    def display_static_mask(self, mask_2d: np.ndarray):
+    def display_static_mask(self, mask_2d: np.ndarray, label: str = "custom_array"):
+        self.last_mask_info = label
+
         if not self.connected:
-            print(f"[DMD Simulated] Loaded static mask shape {mask_2d.shape}")
+            print(f"[DMD Simulated] Loaded static mask '{label}' with shape {mask_2d.shape}")
             return
 
         if mask_2d.shape != (self.height, self.width):

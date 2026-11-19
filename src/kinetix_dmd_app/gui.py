@@ -2,7 +2,9 @@ import time
 from datetime import datetime
 import numpy as np
 import tifffile
-
+import json
+import os
+import time
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
@@ -18,7 +20,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
 import config as cfg
 
 
@@ -74,6 +75,7 @@ class MicroscopeGUI(QMainWindow):
         shm,
         write_idx,
         read_idx,
+        dropped_frames,
         preview_counter,
         sdk_fps,
         preview_event,
@@ -102,6 +104,7 @@ class MicroscopeGUI(QMainWindow):
         )
         self.write_idx = write_idx
         self.read_idx = read_idx
+        self.dropped_frames = dropped_frames
         self.preview_counter = preview_counter
         self.sdk_fps = sdk_fps
         self.preview_event = preview_event
@@ -126,7 +129,7 @@ class MicroscopeGUI(QMainWindow):
         self._build_ui()
 
         default_mask = self.dmd_ctrl.create_center_aperture(radius_px=250)
-        self.dmd_ctrl.display_static_mask(default_mask)
+        self.dmd_ctrl.display_static_mask(default_mask, label="center_aperture_250px")
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.refresh_ui)
@@ -144,12 +147,15 @@ class MicroscopeGUI(QMainWindow):
         btn_load_mask.clicked.connect(self.load_mask_dialog)
         btn_aperture = QPushButton("Center Aperture (250 px)")
         btn_aperture.clicked.connect(
-            lambda: self.dmd_ctrl.display_static_mask(self.dmd_ctrl.create_center_aperture(250))
+            lambda: self.dmd_ctrl.display_static_mask(
+                self.dmd_ctrl.create_center_aperture(250), label="center_aperture_250px"
+            )
         )
         btn_all_on = QPushButton("All Mirrors ON")
         btn_all_on.clicked.connect(
             lambda: self.dmd_ctrl.display_static_mask(
-                np.full((self.dmd_ctrl.height, self.dmd_ctrl.width), 255, dtype=np.uint8)
+                np.full((self.dmd_ctrl.height, self.dmd_ctrl.width), 255, dtype=np.uint8),
+                label="all_mirrors_on",
             )
         )
 
@@ -342,7 +348,27 @@ class MicroscopeGUI(QMainWindow):
             qimg = QImage(path).convertToFormat(QImage.Format_Grayscale8)
             arr = np.frombuffer(qimg.bits(), np.uint8).reshape((qimg.height(), qimg.width())).copy()
 
-        self.dmd_ctrl.display_static_mask(arr)
+        self.dmd_ctrl.display_static_mask(arr, label=path)
+
+    def _save_run_metadata(self, status: str):
+        if not hasattr(self, "current_run_meta") or not self.current_run_meta:
+            return
+
+        self.current_run_meta["status"] = status
+        self.current_run_meta["stop_time_iso"] = datetime.now().isoformat()
+        self.current_run_meta["duration_sec"] = round(
+            time.perf_counter() - self.run_t0, 3
+        )
+        self.current_run_meta["frames_captured"] = int(self.write_idx.value)
+        self.current_run_meta["frames_dropped"] = int(self.dropped_frames.value)
+        self.current_run_meta["last_sdk_fps"] = round(float(self.sdk_fps.value), 2)
+
+        for base_dir in set(cfg.NVME_PATHS):
+            out_dir = os.path.join(base_dir, self.current_run_meta["run_folder"])
+            os.makedirs(out_dir, exist_ok=True)
+            meta_path = os.path.join(out_dir, "metadata.json")
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(self.current_run_meta, f, indent=4)
 
     def on_preview(self):
         self.record_event.clear()
@@ -370,6 +396,7 @@ class MicroscopeGUI(QMainWindow):
             self.write_idx.value = 0
         with self.read_idx.get_lock():
             self.read_idx.value = 0
+        self.dropped_frames.value = 0
         self.last_w = 0
         self.last_t = time.perf_counter()
         self.display_fps = 0.0
@@ -379,31 +406,70 @@ class MicroscopeGUI(QMainWindow):
         self.exposure_us.value = self.spin_exp.value()
         self.record_event.set()
 
+        # Initialize and write initial run metadata
+        self.run_t0 = time.perf_counter()
+        self.current_run_meta = {
+            "run_folder": timestamp,
+            "status": "recording",
+            "start_time_iso": datetime.now().isoformat(),
+            "stop_time_iso": None,
+            "duration_sec": 0.0,
+            "camera": {
+                "model": "Teledyne Kinetix22",
+                "bit_depth": 8,
+                "exposure_us": int(self.exposure_us.value),
+                "roi_x": int(self.roi_x.value),
+                "roi_y": int(self.roi_y.value),
+                "roi_w": int(self.roi_w.value),
+                "roi_h": int(self.roi_h.value),
+                "led_strobe_sync": bool(self.chk_led_ttl.isChecked()),
+            },
+            "dmd": {
+                "connected": bool(self.dmd_ctrl.connected),
+                "width": int(self.dmd_ctrl.width),
+                "height": int(self.dmd_ctrl.height),
+                "active_mask": self.dmd_ctrl.last_mask_info,
+            },
+            "storage": {
+                "nvme_paths": list(cfg.NVME_PATHS),
+                "frames_per_tiff": int(self.frames_per_tiff.value),
+                "active_buffer_slots": int(self.active_slots.value),
+            },
+            "frames_captured": 0,
+            "frames_dropped": 0,
+            "last_sdk_fps": round(float(self.sdk_fps.value), 2),
+        }
+        self._save_run_metadata(status="recording")
+
         self.btn_preview.setEnabled(False)
         self.btn_start.setEnabled(False)
         self.spin_exp.setEnabled(False)
         self.btn_stop.setEnabled(True)
 
     def on_stop(self):
+        was_recording = self.record_event.is_set()
         self.preview_event.clear()
         self.record_event.clear()
         self.display_fps = 0.0
+        if was_recording:
+            self._save_run_metadata(status="completed")
         self.btn_stop.setEnabled(False)
         self.btn_preview.setEnabled(True)
         self.btn_start.setEnabled(True)
         self.spin_exp.setEnabled(True)
 
     def on_quit(self):
-        self.preview_event.clear()
-        self.record_event.clear()
-        self.shutdown_event.set()
         self.close()
 
     def closeEvent(self, event):
+        was_recording = self.record_event.is_set()
         self.preview_event.clear()
         self.record_event.clear()
+        if was_recording:
+            self._save_run_metadata(status="interrupted_on_close")
         self.shutdown_event.set()
         super().closeEvent(event)
+
 
     def refresh_ui(self):
         now = time.perf_counter()
@@ -438,10 +504,16 @@ class MicroscopeGUI(QMainWindow):
         else:
             mode_str = "IDLE"
 
+        dropped = self.dropped_frames.value
+        if dropped > 0:
+            self.lbl_status.setStyleSheet("font-size: 13px; font-weight: bold; color: #ef5350;")
+        else:
+            self.lbl_status.setStyleSheet("font-size: 13px; font-weight: bold; color: white;")
+
         self.lbl_status.setText(
             f"[{mode_str} | {roi_w}x{roi_h}] Rate: {self.display_fps:.1f} FPS "
             f"(SDK: {self.sdk_fps.value:.1f}) | Buffer: {buffered}/{n_slots} ({gb_used:.2f} GB) | "
-            f"Captured: {w} | Written: {r}"
+            f"Captured: {w} | Written: {r} | Dropped: {dropped}"
         )
 
         step = max(1, max(roi_w, roi_h) // 400)

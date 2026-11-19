@@ -1,4 +1,5 @@
 import ctypes
+import os
 import time
 from multiprocessing import Array, Event, Process, Value, shared_memory
 import numpy as np
@@ -11,108 +12,52 @@ from dmd import StaticDMDController
 from gui import MicroscopeGUI
 from workers import camera_worker, disk_writer_worker
 
-
-def apply_dark_theme(app: QApplication):
-    """Apply a global Fusion dark palette across the entire application."""
-    app.setStyle("Fusion")
-    palette = QPalette()
-
-    # Base surfaces
-    palette.setColor(QPalette.Window, QColor(30, 30, 30))
-    palette.setColor(QPalette.WindowText, Qt.white)
-    palette.setColor(QPalette.Base, QColor(20, 20, 20))
-    palette.setColor(QPalette.AlternateBase, QColor(38, 38, 38))
-    palette.setColor(QPalette.ToolTipBase, QColor(45, 45, 45))
-    palette.setColor(QPalette.ToolTipText, Qt.white)
-
-    # Controls & text
-    palette.setColor(QPalette.Text, Qt.white)
-    palette.setColor(QPalette.Button, QColor(45, 45, 45))
-    palette.setColor(QPalette.ButtonText, Qt.white)
-    palette.setColor(QPalette.BrightText, Qt.red)
-
-    # Highlights & disabled states
-    palette.setColor(QPalette.Highlight, QColor(21, 101, 192))
-    palette.setColor(QPalette.HighlightedText, Qt.white)
-    palette.setColor(QPalette.Disabled, QPalette.Text, QColor(127, 127, 127))
-    palette.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(127, 127, 127))
-
-    app.setPalette(palette)
-
-
-def prefault_shared_memory(shm: shared_memory.SharedMemory, page_size: int = 4096):
-    """Touch one byte per 4 KB OS page to commit physical RAM pages before acquisition."""
-    t0 = time.perf_counter()
-    gb = shm.size / (1024 ** 3)
-    print(f"[Memory] Pre-faulting {gb:.1f} GB shared memory pool...")
-    flat_view = np.frombuffer(shm.buf, dtype=np.uint8)
-    flat_view[::page_size] = 0
-    dt = time.perf_counter() - t0
-    print(f"[Memory] Pre-fault complete in {dt:.2f} s.")
-
+# ... keep apply_dark_theme() and prefault_shared_memory() above ...
 
 if __name__ == "__main__":
-    try:
-        shm = shared_memory.SharedMemory(
-            name=cfg.SHM_NAME, create=True, size=cfg.TOTAL_SHM_BYTES
-        )
-    except FileExistsError:
-        shm = shared_memory.SharedMemory(name=cfg.SHM_NAME)
+    # Unique name per launch prevents collisions with any stale mappings
+    session_shm_name = f"{cfg.SHM_NAME}_{os.getpid()}"
+    shm = None
+    dmd_ctrl = None
+    processes = []
 
-    prefault_shared_memory(shm)
-    sdk_fps = Value(ctypes.c_double, 0.0)
-
-    write_idx = Value(ctypes.c_uint64, 0)
-    read_idx = Value(ctypes.c_uint64, 0)
-    preview_counter = Value(ctypes.c_uint64, 0)
-    exposure_us = Value(ctypes.c_uint32, 1000)
-
-    roi_x = Value(ctypes.c_uint32, 0)
-    roi_y = Value(ctypes.c_uint32, 0)
-    roi_w = Value(ctypes.c_uint32, 2400)
-    roi_h = Value(ctypes.c_uint32, 2400)
-
-    # Initial defaults for full-frame 2400x2400 (updated dynamically on Start)
-    active_slots = Value(
-        ctypes.c_uint32, max(16, cfg.RING_BUFFER_BYTES // cfg.MAX_FRAME_BYTES)
-    )
-    frames_per_tiff = Value(
-        ctypes.c_uint32, max(1, cfg.TARGET_TIFF_BYTES // cfg.MAX_FRAME_BYTES)
-    )
-
-    run_folder_buf = Array(ctypes.c_char, 64)
+    shutdown_event = Event()
     preview_event = Event()
     record_event = Event()
-    shutdown_event = Event()
 
-    app = QApplication([])
-    apply_dark_theme(app)
+    try:
+        shm = shared_memory.SharedMemory(
+            name=session_shm_name, create=True, size=cfg.TOTAL_SHM_BYTES
+        )
+        prefault_shared_memory(shm)
 
-    dmd_ctrl = StaticDMDController(alp_version="4.3")
-    window = MicroscopeGUI(
-        shm,
-        write_idx,
-        read_idx,
-        preview_counter,
-        sdk_fps,
-        preview_event,
-        record_event,
-        shutdown_event,
-        exposure_us,
-        roi_x,
-        roi_y,
-        roi_w,
-        roi_h,
-        active_slots,
-        frames_per_tiff,
-        run_folder_buf,
-        dmd_ctrl,
-    )
+        sdk_fps = Value(ctypes.c_double, 0.0)
+        write_idx = Value(ctypes.c_uint64, 0)
+        read_idx = Value(ctypes.c_uint64, 0)
+        dropped_frames = Value(ctypes.c_uint64, 0)
+        preview_counter = Value(ctypes.c_uint64, 0)
+        exposure_us = Value(ctypes.c_uint32, 1000)
 
-    p_cam = Process(
-        target=camera_worker,
-        args=(
-            cfg.SHM_NAME,
+        roi_x = Value(ctypes.c_uint32, 0)
+        roi_y = Value(ctypes.c_uint32, 0)
+        roi_w = Value(ctypes.c_uint32, 2400)
+        roi_h = Value(ctypes.c_uint32, 2400)
+
+        active_slots = Value(
+            ctypes.c_uint32, max(16, cfg.RING_BUFFER_BYTES // cfg.MAX_FRAME_BYTES)
+        )
+        frames_per_tiff = Value(
+            ctypes.c_uint32, max(1, cfg.TARGET_TIFF_BYTES // cfg.MAX_FRAME_BYTES)
+        )
+
+        run_folder_buf = Array(ctypes.c_char, 64)
+
+        app = QApplication([])
+        apply_dark_theme(app)
+
+        dmd_ctrl = StaticDMDController(alp_version="4.3")
+        window = MicroscopeGUI(
+            shm,
             write_idx,
             read_idx,
             preview_counter,
@@ -126,59 +71,95 @@ if __name__ == "__main__":
             roi_w,
             roi_h,
             active_slots,
-            window.chk_led_ttl.isChecked(),
-        ),
-    )
-
-    p_w0 = Process(
-        target=disk_writer_worker,
-        args=(
-            0,
-            cfg.NVME_PATHS[0],
-            run_folder_buf,
-            cfg.SHM_NAME,
-            write_idx,
-            read_idx,
-            roi_w,
-            roi_h,
-            active_slots,
             frames_per_tiff,
-            record_event,
-            shutdown_event,
-        ),
-    )
-
-    p_w1 = Process(
-        target=disk_writer_worker,
-        args=(
-            1,
-            cfg.NVME_PATHS[1],
             run_folder_buf,
-            cfg.SHM_NAME,
-            write_idx,
-            read_idx,
-            roi_w,
-            roi_h,
-            active_slots,
-            frames_per_tiff,
-            record_event,
-            shutdown_event,
-        ),
-    )
+            dmd_ctrl,
+        )
 
-    p_cam.start()
-    p_w0.start()
-    p_w1.start()
+        p_cam = Process(
+            target=camera_worker,
+            args=(
+                session_shm_name,
+                write_idx,
+                read_idx,
+                preview_counter,
+                sdk_fps,
+                preview_event,
+                record_event,
+                shutdown_event,
+                exposure_us,
+                roi_x,
+                roi_y,
+                roi_w,
+                roi_h,
+                active_slots,
+                window.chk_led_ttl.isChecked(),
+            ),
+        )
 
-    window.show()
-    app.exec()
+        p_w0 = Process(
+            target=disk_writer_worker,
+            args=(
+                0,
+                cfg.NVME_PATHS[0],
+                run_folder_buf,
+                session_shm_name,
+                write_idx,
+                read_idx,
+                roi_w,
+                roi_h,
+                active_slots,
+                frames_per_tiff,
+                record_event,
+                shutdown_event,
+            ),
+        )
 
-    shutdown_event.set()
-    preview_event.clear()
-    record_event.clear()
-    p_cam.join(timeout=5)
-    p_w0.join()
-    p_w1.join()
-    dmd_ctrl.shutdown()
-    shm.close()
-    shm.unlink()
+        p_w1 = Process(
+            target=disk_writer_worker,
+            args=(
+                1,
+                cfg.NVME_PATHS[1],
+                run_folder_buf,
+                session_shm_name,
+                write_idx,
+                read_idx,
+                roi_w,
+                roi_h,
+                active_slots,
+                frames_per_tiff,
+                record_event,
+                shutdown_event,
+            ),
+        )
+
+        processes = [p_cam, p_w0, p_w1]
+        for p in processes:
+            p.start()
+
+        window.show()
+        app.exec()
+
+    finally:
+        # Always runs, even if an exception occurs during startup or GUI execution
+        shutdown_event.set()
+        preview_event.clear()
+        record_event.clear()
+
+        for p in processes:
+            if p.is_alive():
+                p.join(timeout=5)
+                if p.is_alive():
+                    print(f"[Cleanup] Force-terminating stuck worker {p.name}...")
+                    p.terminate()
+                    p.join()
+
+        if dmd_ctrl is not None:
+            dmd_ctrl.shutdown()
+
+        if shm is not None:
+            try:
+                shm.close()
+                shm.unlink()
+            except Exception as e:
+                print(f"[Cleanup] SharedMemory release warning: {e}")

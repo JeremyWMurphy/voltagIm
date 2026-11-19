@@ -12,6 +12,7 @@ def camera_worker(
     shm_name: str,
     write_idx: Value,
     read_idx: Value,
+    dropped_frames: Value,
     preview_counter: Value,
     sdk_fps: Value,
     preview_event: Event,
@@ -83,7 +84,6 @@ def camera_worker(
                 w, h = apply_roi_and_exp()
                 n_slots = active_slots.value
 
-                # Build zero-copy 3D view sized specifically for this run's ROI
                 ring_buffer = np.ndarray(
                     (n_slots, h, w),
                     dtype=cfg.DTYPE,
@@ -91,30 +91,43 @@ def camera_worker(
                     offset=0,
                 )
 
-                # 2048-frame SDK buffer provides ~1 s DMA cushion at 2 kHz
                 sdk_frames = min(2048, n_slots)
                 cam.start_live(buffer_frame_count=sdk_frames)
                 print(
                     f"[Camera] Recording {w}x{h} @ {cam.exp_time} us "
-                    f"({n_slots} slots in 96 GB ring)..."
+                    f"({n_slots} slots in ring)..."
                 )
 
+                expected_frame_nr = None
+
                 while record_event.is_set() and not shutdown_event.is_set():
+                    frame, fps, frame_count = cam.poll_frame()
+                    sdk_fps.value = fps
+
+                    # 1. Check for hardware/SDK frame gaps via PyVCAM metadata
+                    meta = frame.get("meta_data", {})
+                    hw_frame_nr = meta.get("frame_nr", frame_count)
+                    if expected_frame_nr is not None and hw_frame_nr > expected_frame_nr:
+                        gap = hw_frame_nr - expected_frame_nr
+                        dropped_frames.value += gap
+                        print(f"[WARNING] Camera/SDK dropped {gap} frame(s)!")
+                    expected_frame_nr = hw_frame_nr + 1
+
+                    # 2. Check if the RAM ring buffer is full
                     if (write_idx.value - read_idx.value) >= n_slots - 4:
+                        dropped_frames.value += 1
                         print("[WARNING] RAM Ring Buffer Full! Dropping frame.")
-                        time.sleep(0.0005)
                         continue
 
-                    frame, fps, _ = cam.poll_frame()
-                    sdk_fps.value = fps
                     slot = write_idx.value % n_slots
                     ring_buffer[slot] = frame["pixel_data"]
-
-                    # Single-producer increment (no lock needed while recording)
                     write_idx.value += 1
 
                 cam.finish()
-                print(f"[Camera] Recording stopped. Captured: {write_idx.value}")
+                print(
+                    f"[Camera] Recording stopped. Captured: {write_idx.value} | "
+                    f"Dropped: {dropped_frames.value}"
+                )
 
             # --- MODE B: LIVE PREVIEW ONLY ---
             elif preview_event.is_set():
